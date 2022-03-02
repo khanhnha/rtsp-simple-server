@@ -12,7 +12,6 @@ import (
 
 	"github.com/aler9/gortsplib"
 	"github.com/aler9/gortsplib/pkg/base"
-	"github.com/aler9/gortsplib/pkg/h264"
 	"github.com/aler9/gortsplib/pkg/rtph264"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
@@ -171,6 +170,8 @@ func (s *rtspSource) runInner() bool {
 	}
 	defer c.Close()
 
+	var h264Decoders map[int]*rtph264.Decoder
+
 	readErr := make(chan error)
 	go func() {
 		readErr <- func() error {
@@ -186,9 +187,14 @@ func (s *rtspSource) runInner() bool {
 				}
 			}
 
-			err = s.handleMissingH264Params(c, tracks)
-			if err != nil {
-				return err
+			for i, t := range tracks {
+				if _, ok := t.(*gortsplib.TrackH264); ok {
+					if h264Decoders == nil {
+						h264Decoders = make(map[int]*rtph264.Decoder)
+					}
+
+					h264Decoders[i] = rtph264.NewDecoder()
+				}
 			}
 
 			res := s.parent.onSourceStaticSetReady(pathSourceStaticSetReadyReq{
@@ -206,7 +212,25 @@ func (s *rtspSource) runInner() bool {
 			}()
 
 			c.OnPacketRTP = func(trackID int, pkt *rtp.Packet) {
-				res.stream.onPacketRTP(trackID, pkt)
+				_, ok := c.Tracks()[trackID].(*gortsplib.TrackH264)
+				if ok {
+					nalus, pts, err := h264Decoders[trackID].DecodeUntilMarker(pkt)
+					if err == nil {
+						res.stream.onPacketRTP(trackID, &data{
+							rtp:   pkt,
+							nalus: append([][]byte(nil), nalus...),
+							pts:   pts,
+						})
+					} else {
+						res.stream.onPacketRTP(trackID, &data{
+							rtp: pkt,
+						})
+					}
+				} else {
+					res.stream.onPacketRTP(trackID, &data{
+						rtp: pkt,
+					})
+				}
 			}
 
 			c.OnPacketRTCP = func(trackID int, pkt rtcp.Packet) {
@@ -231,139 +255,6 @@ func (s *rtspSource) runInner() bool {
 		c.Close()
 		<-readErr
 		return false
-	}
-}
-
-func (s *rtspSource) handleMissingH264Params(c *gortsplib.Client, tracks gortsplib.Tracks) error {
-	h264Track, h264TrackID := func() (*gortsplib.TrackH264, int) {
-		for i, t := range tracks {
-			if th264, ok := t.(*gortsplib.TrackH264); ok {
-				if th264.SPS() == nil {
-					return th264, i
-				}
-			}
-		}
-		return nil, -1
-	}()
-	if h264TrackID < 0 {
-		return nil
-	}
-
-	if h264Track.SPS() != nil && h264Track.PPS() != nil {
-		return nil
-	}
-
-	s.log(logger.Info, "source has not provided H264 parameters (SPS and PPS)"+
-		" inside the SDP; extracting them from the stream...")
-
-	var streamMutex sync.RWMutex
-	var stream *stream
-	decoder := rtph264.NewDecoder()
-	var sps []byte
-	var pps []byte
-	paramsReceived := make(chan struct{})
-
-	c.OnPacketRTP = func(trackID int, pkt *rtp.Packet) {
-		streamMutex.RLock()
-		defer streamMutex.RUnlock()
-
-		if stream == nil {
-			if trackID != h264TrackID {
-				return
-			}
-
-			select {
-			case <-paramsReceived:
-				return
-			default:
-			}
-
-			nalus, _, err := decoder.Decode(pkt)
-			if err != nil {
-				return
-			}
-
-			for _, nalu := range nalus {
-				typ := h264.NALUType(nalu[0] & 0x1F)
-				switch typ {
-				case h264.NALUTypeSPS:
-					sps = nalu
-					if sps != nil && pps != nil {
-						close(paramsReceived)
-					}
-
-				case h264.NALUTypePPS:
-					pps = nalu
-					if sps != nil && pps != nil {
-						close(paramsReceived)
-					}
-				}
-			}
-		} else {
-			stream.onPacketRTP(trackID, pkt)
-		}
-	}
-
-	c.OnPacketRTCP = func(trackID int, pkt rtcp.Packet) {
-		streamMutex.RLock()
-		defer streamMutex.RUnlock()
-
-		if stream != nil {
-			stream.onPacketRTCP(trackID, pkt)
-		}
-	}
-
-	_, err := c.Play(nil)
-	if err != nil {
-		return err
-	}
-
-	readErr := make(chan error)
-	go func() {
-		readErr <- c.Wait()
-	}()
-
-	timeout := time.NewTimer(15 * time.Second)
-	defer timeout.Stop()
-
-	select {
-	case err := <-readErr:
-		return err
-
-	case <-timeout.C:
-		c.Close()
-		<-readErr
-		return fmt.Errorf("source did not send H264 parameters in time")
-
-	case <-paramsReceived:
-		s.log(logger.Info, "H264 parameters extracted")
-
-		h264Track.SetSPS(sps)
-		h264Track.SetPPS(pps)
-
-		res := s.parent.onSourceStaticSetReady(pathSourceStaticSetReadyReq{
-			source: s,
-			tracks: tracks,
-		})
-		if res.err != nil {
-			c.Close()
-			<-readErr
-			return res.err
-		}
-
-		func() {
-			streamMutex.Lock()
-			defer streamMutex.Unlock()
-			stream = res.stream
-		}()
-
-		s.log(logger.Info, "ready")
-
-		defer func() {
-			s.parent.onSourceStaticSetNotReady(pathSourceStaticSetNotReadyReq{source: s})
-		}()
-
-		return <-readErr
 	}
 }
 

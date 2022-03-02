@@ -144,9 +144,21 @@ func (s *hlsSource) runInner() bool {
 			return
 		}
 
-		for _, pkt := range pkts {
+		lastPkt := len(pkts) - 1
+		for i, pkt := range pkts {
 			rtcpSenders.OnPacketRTP(videoTrackID, pkt)
-			stream.onPacketRTP(videoTrackID, pkt)
+
+			if i != lastPkt {
+				stream.onPacketRTP(videoTrackID, &data{
+					rtp: pkt,
+				})
+			} else {
+				stream.onPacketRTP(videoTrackID, &data{
+					rtp:   pkt,
+					nalus: nalus,
+					pts:   pts,
+				})
+			}
 		}
 	}
 
@@ -162,7 +174,7 @@ func (s *hlsSource) runInner() bool {
 
 		for _, pkt := range pkts {
 			rtcpSenders.OnPacketRTP(audioTrackID, pkt)
-			stream.onPacketRTP(audioTrackID, pkt)
+			stream.onPacketRTP(audioTrackID, &data{rtp: pkt})
 		}
 	}
 

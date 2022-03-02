@@ -5,7 +5,6 @@ import (
 
 	"github.com/aler9/gortsplib"
 	"github.com/pion/rtcp"
-	"github.com/pion/rtp"
 )
 
 type streamNonRTSPReadersMap struct {
@@ -37,12 +36,12 @@ func (m *streamNonRTSPReadersMap) remove(r reader) {
 	delete(m.ma, r)
 }
 
-func (m *streamNonRTSPReadersMap) forwardPacketRTP(trackID int, pkt *rtp.Packet) {
+func (m *streamNonRTSPReadersMap) forwardPacketRTP(trackID int, data *data) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
 	for c := range m.ma {
-		c.onReaderPacketRTP(trackID, pkt)
+		c.onReaderPacketRTP(trackID, data)
 	}
 }
 
@@ -89,12 +88,12 @@ func (s *stream) readerRemove(r reader) {
 	}
 }
 
-func (s *stream) onPacketRTP(trackID int, pkt *rtp.Packet) {
+func (s *stream) onPacketRTP(trackID int, data *data) {
 	// forward to RTSP readers
-	s.rtspStream.WritePacketRTP(trackID, pkt)
+	s.rtspStream.WritePacketRTP(trackID, data.rtp)
 
 	// forward to non-RTSP readers
-	s.nonRTSPReaders.forwardPacketRTP(trackID, pkt)
+	s.nonRTSPReaders.forwardPacketRTP(trackID, data)
 }
 
 func (s *stream) onPacketRTCP(trackID int, pkt rtcp.Packet) {

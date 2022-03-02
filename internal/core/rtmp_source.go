@@ -11,7 +11,6 @@ import (
 	"github.com/aler9/gortsplib/pkg/rtpaac"
 	"github.com/aler9/gortsplib/pkg/rtph264"
 	"github.com/notedit/rtmp/av"
-	"github.com/pion/rtp"
 
 	"github.com/aler9/rtsp-simple-server/internal/conf"
 	"github.com/aler9/rtsp-simple-server/internal/logger"
@@ -165,11 +164,6 @@ func (s *rtmpSource) runInner() bool {
 					rtcpSenders := rtcpsenderset.New(tracks, res.stream.onPacketRTCP)
 					defer rtcpSenders.Close()
 
-					onPacketRTP := func(trackID int, pkt *rtp.Packet) {
-						rtcpSenders.OnPacketRTP(trackID, pkt)
-						res.stream.onPacketRTP(trackID, pkt)
-					}
-
 					for {
 						conn.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
 						pkt, err := conn.ReadPacket()
@@ -200,13 +194,28 @@ func (s *rtmpSource) runInner() bool {
 								outNALUs = append(outNALUs, nalu)
 							}
 
-							pkts, err := h264Encoder.Encode(outNALUs, pkt.Time+pkt.CTime)
+							pts := pkt.Time + pkt.CTime
+
+							pkts, err := h264Encoder.Encode(outNALUs, pts)
 							if err != nil {
 								return fmt.Errorf("error while encoding H264: %v", err)
 							}
 
-							for _, pkt := range pkts {
-								onPacketRTP(videoTrackID, pkt)
+							lastPkt := len(pkts) - 1
+							for i, pkt := range pkts {
+								rtcpSenders.OnPacketRTP(videoTrackID, pkt)
+
+								if i != lastPkt {
+									res.stream.onPacketRTP(videoTrackID, &data{
+										rtp: pkt,
+									})
+								} else {
+									res.stream.onPacketRTP(videoTrackID, &data{
+										rtp:   pkt,
+										nalus: outNALUs,
+										pts:   pts,
+									})
+								}
 							}
 
 						case av.AAC:
@@ -220,7 +229,8 @@ func (s *rtmpSource) runInner() bool {
 							}
 
 							for _, pkt := range pkts {
-								onPacketRTP(audioTrackID, pkt)
+								rtcpSenders.OnPacketRTP(audioTrackID, pkt)
+								res.stream.onPacketRTP(audioTrackID, &data{rtp: pkt})
 							}
 						}
 					}

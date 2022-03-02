@@ -9,8 +9,8 @@ import (
 
 	"github.com/aler9/gortsplib"
 	"github.com/aler9/gortsplib/pkg/base"
+	"github.com/aler9/gortsplib/pkg/rtph264"
 	"github.com/pion/rtcp"
-	"github.com/pion/rtp"
 
 	"github.com/aler9/rtsp-simple-server/internal/conf"
 	"github.com/aler9/rtsp-simple-server/internal/externalcmd"
@@ -43,10 +43,10 @@ type rtspSession struct {
 	path            *path
 	state           gortsplib.ServerSessionState
 	stateMutex      sync.Mutex
-	setuppedTracks  map[int]gortsplib.Track // read
-	onReadCmd       *externalcmd.Cmd        // read
-	announcedTracks gortsplib.Tracks        // publish
-	stream          *stream                 // publish
+	onReadCmd       *externalcmd.Cmd         // read
+	announcedTracks gortsplib.Tracks         // publish
+	stream          *stream                  // publish
+	h264Decoders    map[int]*rtph264.Decoder // publish
 }
 
 func newRTSPSession(
@@ -160,6 +160,16 @@ func (s *rtspSession) onAnnounce(c *rtspConn, ctx *gortsplib.ServerHandlerOnAnno
 	s.path = res.path
 	s.announcedTracks = ctx.Tracks
 
+	for i, t := range s.announcedTracks {
+		if _, ok := t.(*gortsplib.TrackH264); ok {
+			if s.h264Decoders == nil {
+				s.h264Decoders = make(map[int]*rtph264.Decoder)
+			}
+
+			s.h264Decoders[i] = rtph264.NewDecoder()
+		}
+	}
+
 	s.stateMutex.Lock()
 	s.state = gortsplib.ServerSessionStatePreRecord
 	s.stateMutex.Unlock()
@@ -228,11 +238,6 @@ func (s *rtspSession) onSetup(c *rtspConn, ctx *gortsplib.ServerHandlerOnSetupCt
 				StatusCode: base.StatusBadRequest,
 			}, nil, fmt.Errorf("track %d does not exist", ctx.TrackID)
 		}
-
-		if s.setuppedTracks == nil {
-			s.setuppedTracks = make(map[int]gortsplib.Track)
-		}
-		s.setuppedTracks[ctx.TrackID] = res.stream.tracks()[ctx.TrackID]
 
 		s.stateMutex.Lock()
 		s.state = gortsplib.ServerSessionStatePrePlay
@@ -347,7 +352,7 @@ func (s *rtspSession) onReaderAccepted() {
 }
 
 // onReaderPacketRTP implements reader.
-func (s *rtspSession) onReaderPacketRTP(trackID int, pkt *rtp.Packet) {
+func (s *rtspSession) onReaderPacketRTP(trackID int, data *data) {
 	// packets are routed to the session by gortsplib.ServerStream.
 }
 
@@ -406,7 +411,26 @@ func (s *rtspSession) onPacketRTP(ctx *gortsplib.ServerHandlerOnPacketRTPCtx) {
 		return
 	}
 
-	s.stream.onPacketRTP(ctx.TrackID, ctx.Packet)
+	_, ok := s.announcedTracks[ctx.TrackID].(*gortsplib.TrackH264)
+	if ok {
+		nalus, pts, err := s.h264Decoders[ctx.TrackID].DecodeUntilMarker(ctx.Packet)
+
+		if err == nil {
+			s.stream.onPacketRTP(ctx.TrackID, &data{
+				rtp:   ctx.Packet,
+				nalus: append([][]byte(nil), nalus...),
+				pts:   pts,
+			})
+		} else {
+			s.stream.onPacketRTP(ctx.TrackID, &data{
+				rtp: ctx.Packet,
+			})
+		}
+	} else {
+		s.stream.onPacketRTP(ctx.TrackID, &data{
+			rtp: ctx.Packet,
+		})
+	}
 }
 
 // onPacketRTCP is called by rtspServer.
